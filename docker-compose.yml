@@ -1,0 +1,83 @@
+name: plc-counter
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      retries: 10
+    # No published port: only the api container can reach the DB.
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      APP_API_KEY: ${APP_API_KEY}
+      INGEST_API_KEY: ${INGEST_API_KEY}
+      HEARTBEAT_INTERVAL_S: ${HEARTBEAT_INTERVAL_S:-60}
+      SOURCE_LABELS: ${SOURCE_LABELS:-plc_line_2=Line 2}
+      DISPLAY_TZ: ${DISPLAY_TZ:-Africa/Tunis}
+      SHIFT_NAMES: ${SHIFT_NAMES:-A,B,C}
+      SHIFT_START: ${SHIFT_START:-06:00}
+    ports:
+      # 127.0.0.1 on the VPS (Caddy terminates HTTPS). Set API_BIND=0.0.0.0 for a LAN-only HTTP setup.
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
+
+  # HTTPS reverse proxy with automatic Let's Encrypt certificate (VPS). Needs DOMAIN pointing to the VPS.
+  caddy:
+    image: caddy:2.8-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on: [api]
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+
+  # Runs on the factory LAN machine (the only one that can reach the PLC).
+  collector:
+    build: ./collector
+    profiles: ["collector"]
+    restart: unless-stopped
+    stop_grace_period: 20s
+    environment:
+      PLC_READER: ${PLC_READER:-snap7}
+      PLC_IP: ${PLC_IP}
+      PLC_RACK: ${PLC_RACK:-0}
+      PLC_SLOT: ${PLC_SLOT:-1}
+      TAGS: ${TAGS:-plc_line_2:MK:0:10:DINT}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-200}
+      HEARTBEAT_INTERVAL_S: ${HEARTBEAT_INTERVAL_S:-60}
+      API_URL: ${API_URL}
+      INGEST_API_KEY: ${INGEST_API_KEY}
+      API_VERIFY_TLS: ${API_VERIFY_TLS:-true}
+      BUFFER_PATH: /data/buffer.sqlite3
+      FAKE_RATE_PER_MIN: ${FAKE_RATE_PER_MIN:-24}
+      FAKE_DISCONNECT_PROB: ${FAKE_DISCONNECT_PROB:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - collector_buffer:/data
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  pgdata:
+  caddy_data:
+  collector_buffer:
